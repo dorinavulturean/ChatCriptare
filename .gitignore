@@ -1,0 +1,9 @@
+.vs/
+.idea/
+.venv/
+__pycache__/
+*.pyc
+data/*
+!data/.gitkeep
+*.key
+known_keys.json
