@@ -1,0 +1,6 @@
+services:
+  server:
+    build: .
+    command: python -m server.main
+    ports:
+      - "9000:9000"
