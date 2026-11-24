@@ -7,3 +7,5 @@ data/*
 !data/.gitkeep
 *.key
 known_keys.json
+.ruff_cache/
+.pytest_cache/
