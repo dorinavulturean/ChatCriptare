@@ -47,6 +47,12 @@ async def handle_client(reader, writer):
                 ciphertext = msg.get("ciphertext", "")
                 log.info("MSG %s -> %s len=%d", name, msg["to"], len(ciphertext))
                 await send(dest[0], {"type": "MSG", "from": name, "ciphertext": ciphertext})
+            elif kind == "GET_KEY":
+                target = clients.get(msg.get("name"))
+                if target is None:
+                    await send(writer, {"type": "ERROR", "reason": "utilizator necunoscut"})
+                else:
+                    await send(writer, {"type": "KEY", "name": msg["name"], "pubkey": target[1]})
             else:
                 await send(writer, {"type": "ERROR", "reason": "tip necunoscut"})
     except (asyncio.IncompleteReadError, ConnectionError):
