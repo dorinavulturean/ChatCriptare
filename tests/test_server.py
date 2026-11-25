@@ -48,3 +48,19 @@ def test_nume_duplicat():
 
     got = asyncio.run(with_server(scenario))
     assert got["type"] == "ERROR"
+
+def test_get_key():
+    async def scenario(port):
+        ra, wa = await connect(port, "ana")
+        rb, wb = await connect(port, "bogdan")
+        await unpack(ra)
+        await unpack(rb)
+        wa.write(pack({"type": "GET_KEY", "name": "bogdan"}))
+        await wa.drain()
+        got = await asyncio.wait_for(unpack(ra), 2)
+        wa.close()
+        wb.close()
+        return got
+
+    got = asyncio.run(with_server(scenario))
+    assert got == {"type": "KEY", "name": "bogdan", "pubkey": "k"}
