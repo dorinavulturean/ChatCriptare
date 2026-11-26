@@ -11,6 +11,12 @@ from common.protocol import pack, unpack
 HOST = "localhost"
 PORT = 9000
 
+MAX_TEXT_BYTES = 4000
+
+
+def too_long(text):
+    return len(text.encode("utf-8")) > MAX_TEXT_BYTES
+
 HELP = (
     "Comenzi: /list, /msg <nume> <text>, /join <camera>, /leave, /members, "
     "/group <text>, /fingerprint [nume], /trust <nume>, /quit"
@@ -128,6 +134,9 @@ class Client:
             print("[sistem] conexiune inchisa")
 
     async def send_private(self, to, text):
+        if too_long(text):
+            print(f"[sistem] mesaj prea lung (maxim {MAX_TEXT_BYTES} bytes)")
+            return
         key = await self.get_key(to)
         if key is None:
             print("[sistem] utilizator necunoscut")
@@ -150,6 +159,9 @@ class Client:
     async def send_group(self, text):
         if self.room is None:
             print("[sistem] nu esti intr-o camera, foloseste /join <camera>")
+            return
+        if too_long(text):
+            print(f"[sistem] mesaj prea lung (maxim {MAX_TEXT_BYTES} bytes)")
             return
         members = await self.get_members(self.room)
         if members is None:
@@ -278,7 +290,14 @@ async def main():
                 line_task.cancel()
                 break
             line = line_task.result()
-            if line is None or not await client.handle_line(line.strip()):
+            if line is None:
+                break
+            try:
+                keep_going = await client.handle_line(line.strip())
+            except ValueError:
+                print("[sistem] mesajul e prea mare pentru a fi trimis")
+                continue
+            if not keep_going:
                 break
     finally:
         receiver.cancel()

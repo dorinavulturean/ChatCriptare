@@ -33,3 +33,9 @@ def test_lungime_prea_mare():
     data = struct.pack(">I", MAX_SIZE + 1) + b"x"
     with pytest.raises(ValueError):
         asyncio.run(run(data))
+
+def test_json_nu_e_obiect():
+    data = b"[1, 2, 3]"
+    raw = struct.pack(">I", len(data)) + data
+    with pytest.raises(ValueError):
+        asyncio.run(run(raw))
