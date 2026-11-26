@@ -2,7 +2,7 @@ import asyncio
 
 from common.protocol import pack, unpack
 from server import main as server_main
-from server.main import clients, handle_client
+from server.main import MAX_CIPHERTEXT, clients, handle_client
 from server.storage import Storage
 
 
@@ -163,3 +163,53 @@ def test_offline_destinatar_necunoscut():
 
     got = asyncio.run(with_server(scenario))
     assert got["type"] == "ERROR"
+
+
+def test_flood_deconecteaza(monkeypatch):
+    monkeypatch.setattr(server_main, "BURST", 3)
+
+    async def scenario(port):
+        ra, wa = await connect(port, "ana")
+        assert (await unpack(ra))["type"] == "OK"
+        wa.write(b"".join(pack({"type": "LIST"}) for _ in range(30)))
+        await wa.drain()
+        types = []
+        while True:
+            try:
+                msg = await asyncio.wait_for(unpack(ra), 2)
+            except asyncio.IncompleteReadError:
+                break
+            types.append(msg["type"])
+        wa.close()
+        return types
+
+    types = asyncio.run(with_server(scenario))
+    assert "ERROR" in types
+    assert types.count("USERS") < 30
+
+
+def test_register_timeout(monkeypatch):
+    monkeypatch.setattr(server_main, "REGISTER_TIMEOUT", 0.2)
+
+    async def scenario(port):
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        data = await asyncio.wait_for(reader.read(), 2)
+        writer.close()
+        return data
+
+    assert asyncio.run(with_server(scenario)) == b""
+
+
+def test_ciphertext_prea_lung():
+    async def scenario(port):
+        ra, wa = await connect(port, "ana")
+        assert (await unpack(ra))["type"] == "OK"
+        wa.write(pack({"type": "MSG", "to": "bogdan", "ciphertext": "x" * (MAX_CIPHERTEXT + 1)}))
+        await wa.drain()
+        got = await asyncio.wait_for(unpack(ra), 2)
+        wa.close()
+        return got
+
+    got = asyncio.run(with_server(scenario))
+    assert got == {"type": "ERROR", "reason": "mesaj invalid sau prea lung"}
+

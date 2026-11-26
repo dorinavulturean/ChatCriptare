@@ -19,4 +19,7 @@ async def unpack(reader) -> dict:
     if length > MAX_SIZE:
         raise ValueError("mesaj prea mare")
     data = await reader.readexactly(length)
-    return json.loads(data.decode("utf-8"))
+    msg = json.loads(data.decode("utf-8"))
+    if not isinstance(msg, dict):
+        raise ValueError("mesajul trebuie sa fie un obiect JSON")  # noqa: TRY004
+    return msg

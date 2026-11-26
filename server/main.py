@@ -4,10 +4,19 @@ import os
 import re
 
 from common.protocol import pack, unpack
+from server.limits import RateLimiter
 from server.storage import Storage
 
 HOST = "0.0.0.0"
 PORT = 9000
+
+REGISTER_TIMEOUT = 10  # secunde pana la primul mesaj (REGISTER)
+IDLE_TIMEOUT = 300  # secunde fara niciun mesaj
+SEND_TIMEOUT = 5  # secunde pentru a trimite catre un client lent
+RATE = 5.0  # mesaje pe secunda, in medie
+BURST = 10  # mesaje permise deodata
+MAX_CLIENTS = 100
+MAX_CIPHERTEXT = 8192  # caractere (base64)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("server")
@@ -22,13 +31,18 @@ storage = Storage(os.environ.get("E2E_STORE", "data/store.json"))
 
 async def send(writer, msg):
     writer.write(pack(msg))
-    await writer.drain()
+    await asyncio.wait_for(writer.drain(), SEND_TIMEOUT)
+
+
+def valid_ciphertext(value):
+    return isinstance(value, str) and 0 < len(value) <= MAX_CIPHERTEXT
 
 
 async def handle_client(reader, writer):
     name = None
+    limiter = RateLimiter(RATE, BURST)
     try:
-        msg = await unpack(reader)
+        msg = await asyncio.wait_for(unpack(reader), REGISTER_TIMEOUT)
         wanted = msg.get("name")
         pubkey = msg.get("pubkey", "")
         if msg.get("type") != "REGISTER" or not isinstance(wanted, str):
@@ -39,6 +53,9 @@ async def handle_client(reader, writer):
             return
         if wanted in clients:
             await send(writer, {"type": "ERROR", "reason": "nume deja folosit"})
+            return
+        if len(clients) >= MAX_CLIENTS:
+            await send(writer, {"type": "ERROR", "reason": "server plin"})
             return
 
         name = wanted
@@ -56,7 +73,11 @@ async def handle_client(reader, writer):
         storage.clear(name)
 
         while True:
-            msg = await unpack(reader)
+            msg = await asyncio.wait_for(unpack(reader), IDLE_TIMEOUT)
+            if not limiter.allow():
+                log.info("FLOOD %s deconectat", name)
+                await send(writer, {"type": "ERROR", "reason": "prea multe mesaje"})
+                break
             kind = msg.get("type")
             if kind == "LIST":
                 await send(writer, {"type": "USERS", "users": sorted(clients)})
@@ -69,9 +90,9 @@ async def handle_client(reader, writer):
                     await send(writer, {"type": "KEY", "name": target, "pubkey": pub})
             elif kind == "MSG":
                 to = msg.get("to")
-                ciphertext = msg.get("ciphertext", "")
-                if not isinstance(to, str) or not isinstance(ciphertext, str):
-                    await send(writer, {"type": "ERROR", "reason": "mesaj invalid"})
+                ciphertext = msg.get("ciphertext")
+                if not isinstance(to, str) or not valid_ciphertext(ciphertext):
+                    await send(writer, {"type": "ERROR", "reason": "mesaj invalid sau prea lung"})
                     continue
                 dest = clients.get(to)
                 if dest is not None:
@@ -79,7 +100,7 @@ async def handle_client(reader, writer):
                         await send(dest[0], {"type": "MSG", "from": name, "ciphertext": ciphertext})
                         log.info("MSG %s -> %s len=%d", name, to, len(ciphertext))
                         continue
-                    except ConnectionError:
+                    except (ConnectionError, TimeoutError):
                         pass
                 if storage.get_key(to) is None:
                     await send(writer, {"type": "ERROR", "reason": "utilizator necunoscut"})
@@ -127,7 +148,7 @@ async def handle_client(reader, writer):
                         continue
                     to = item.get("to")
                     ciphertext = item.get("ciphertext")
-                    if not isinstance(to, str) or not isinstance(ciphertext, str):
+                    if not isinstance(to, str) or not valid_ciphertext(ciphertext):
                         continue
                     if to == name or to not in members or to not in clients:
                         continue
@@ -137,11 +158,13 @@ async def handle_client(reader, writer):
                             {"type": "GROUP_MSG", "room": room, "from": name, "ciphertext": ciphertext},
                         )
                         delivered += 1
-                    except ConnectionError:
+                    except (ConnectionError, TimeoutError):
                         pass
                 log.info("GROUP_MSG %s in %s catre %d membri", name, room, delivered)
             else:
                 await send(writer, {"type": "ERROR", "reason": "tip necunoscut"})
+    except TimeoutError:
+        log.info("TIMEOUT %s", name)
     except (asyncio.IncompleteReadError, ConnectionError):
         pass
     except ValueError as e:
@@ -166,4 +189,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
