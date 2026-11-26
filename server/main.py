@@ -1,8 +1,10 @@
 import asyncio
 import logging
+import os
 import re
 
 from common.protocol import pack, unpack
+from server.storage import Storage
 
 HOST = "0.0.0.0"
 PORT = 9000
@@ -10,10 +12,12 @@ PORT = 9000
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("server")
 
-# nume -> (writer, cheie publica)
+NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+
+# nume -> (writer, cheie publica), doar cei online
 clients = {}
 rooms = {}  # camera -> set de nume
-ROOM_RE = re.compile(r"[A-Za-z0-9_-]{1,32}")
+storage = Storage(os.environ.get("E2E_STORE", "data/store.json"))
 
 
 async def send(writer, msg):
@@ -25,17 +29,31 @@ async def handle_client(reader, writer):
     name = None
     try:
         msg = await unpack(reader)
-        if msg.get("type") != "REGISTER" or not msg.get("name"):
+        wanted = msg.get("name")
+        pubkey = msg.get("pubkey", "")
+        if msg.get("type") != "REGISTER" or not isinstance(wanted, str):
             await send(writer, {"type": "ERROR", "reason": "trebuie REGISTER"})
             return
-        if msg["name"] in clients:
+        if not NAME_RE.fullmatch(wanted) or not isinstance(pubkey, str) or len(pubkey) > 200:
+            await send(writer, {"type": "ERROR", "reason": "nume sau cheie invalida"})
+            return
+        if wanted in clients:
             await send(writer, {"type": "ERROR", "reason": "nume deja folosit"})
             return
 
-        name = msg["name"]
-        clients[name] = (writer, msg.get("pubkey", ""))
+        name = wanted
+        clients[name] = (writer, pubkey)
+        storage.set_key(name, pubkey)
         await send(writer, {"type": "OK"})
         log.info("REGISTER %s", name)
+
+        # livreaza mesajele primite cat timp era offline
+        for item in storage.pending(name):
+            await send(
+                writer,
+                {"type": "MSG", "from": item["from"], "ciphertext": item["ciphertext"], "offline": True},
+            )
+        storage.clear(name)
 
         while True:
             msg = await unpack(reader)
@@ -43,22 +61,36 @@ async def handle_client(reader, writer):
             if kind == "LIST":
                 await send(writer, {"type": "USERS", "users": sorted(clients)})
             elif kind == "GET_KEY":
-                target = clients.get(msg.get("name"))
-                if target is None:
+                target = msg.get("name")
+                pub = storage.get_key(target) if isinstance(target, str) else None
+                if pub is None:
                     await send(writer, {"type": "ERROR", "reason": "utilizator necunoscut"})
                 else:
-                    await send(writer, {"type": "KEY", "name": msg["name"], "pubkey": target[1]})
+                    await send(writer, {"type": "KEY", "name": target, "pubkey": pub})
             elif kind == "MSG":
-                dest = clients.get(msg.get("to"))
-                if dest is None:
-                    await send(writer, {"type": "ERROR", "reason": "utilizator offline"})
-                    continue
+                to = msg.get("to")
                 ciphertext = msg.get("ciphertext", "")
-                log.info("MSG %s -> %s len=%d", name, msg["to"], len(ciphertext))
-                await send(dest[0], {"type": "MSG", "from": name, "ciphertext": ciphertext})
+                if not isinstance(to, str) or not isinstance(ciphertext, str):
+                    await send(writer, {"type": "ERROR", "reason": "mesaj invalid"})
+                    continue
+                dest = clients.get(to)
+                if dest is not None:
+                    try:
+                        await send(dest[0], {"type": "MSG", "from": name, "ciphertext": ciphertext})
+                        log.info("MSG %s -> %s len=%d", name, to, len(ciphertext))
+                        continue
+                    except ConnectionError:
+                        pass
+                if storage.get_key(to) is None:
+                    await send(writer, {"type": "ERROR", "reason": "utilizator necunoscut"})
+                elif storage.enqueue(to, {"from": name, "ciphertext": ciphertext}):
+                    log.info("QUEUE %s -> %s len=%d", name, to, len(ciphertext))
+                    await send(writer, {"type": "QUEUED", "to": to})
+                else:
+                    await send(writer, {"type": "ERROR", "reason": "cutia postala e plina"})
             elif kind == "JOIN":
                 room = str(msg.get("room", ""))
-                if not ROOM_RE.fullmatch(room):
+                if not NAME_RE.fullmatch(room):
                     await send(writer, {"type": "ERROR", "reason": "nume camera invalid"})
                     continue
                 members = rooms.setdefault(room, set())
@@ -134,3 +166,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
