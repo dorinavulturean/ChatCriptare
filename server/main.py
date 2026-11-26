@@ -102,13 +102,16 @@ async def handle_client(reader, writer):
                         continue
                     except (ConnectionError, TimeoutError):
                         pass
+                if ciphertext.startswith(("eph1:", "eph2:")):
+                    await send(writer, {"type": "ERROR", "reason": "utilizator offline"})
+                    continue
                 if storage.get_key(to) is None:
                     await send(writer, {"type": "ERROR", "reason": "utilizator necunoscut"})
                 elif storage.enqueue(to, {"from": name, "ciphertext": ciphertext}):
                     log.info("QUEUE %s -> %s len=%d", name, to, len(ciphertext))
                     await send(writer, {"type": "QUEUED", "to": to})
                 else:
-                    await send(writer, {"type": "ERROR", "reason": "cutia postala e plina"})
+                    await send(writer, {"type": "ERROR", "reason": "cutia postala e plina"})   
             elif kind == "JOIN":
                 room = str(msg.get("room", ""))
                 if not NAME_RE.fullmatch(room):
