@@ -11,7 +11,10 @@ from common.protocol import pack, unpack
 HOST = "localhost"
 PORT = 9000
 
-HELP = "Comenzi: /list, /msg <nume> <text>, /fingerprint [nume], /trust <nume>, /quit"
+HELP = (
+    "Comenzi: /list, /msg <nume> <text>, /join <camera>, /leave, /members, "
+    "/group <text>, /fingerprint [nume], /trust <nume>, /quit"
+)
 
 
 class Client:
@@ -24,6 +27,8 @@ class Client:
         self.pending = {}  # nume -> Future (cerere GET_KEY in curs)
         self.tasks = set()
         self.untrusted = {}  # nume -> cheie noua, in asteptare de acceptare
+        self.room = None  # camera curenta
+        self.members_waiter = None  # Future pentru raspunsul MEMBERS
 
     async def send(self, msg):
         self.writer.write(pack(msg))
@@ -45,16 +50,18 @@ class Client:
 
     async def show_message(self, msg):
         sender = msg.get("from", "?")
+        room = msg.get("room")
+        tag = f"[{room}]" if room else ""
         key = await self.get_key(sender)
         if key is None:
-            print(f"[{sender}] (nu am o cheie de incredere pentru expeditor)")
+            print(f"{tag}[{sender}] (nu am o cheie de incredere pentru expeditor)")
             return
         try:
             text = decrypt(msg.get("ciphertext", ""), self.private, key)
         except (CryptoError, ValueError):
-            print(f"[{sender}] (mesaj invalid sau modificat, respins)")
+            print(f"{tag}[{sender}] (mesaj invalid sau modificat, respins)")
             return
-        print(f"[{sender}] {text}")
+        print(f"{tag}[{sender}] {text}")
 
     async def receive_loop(self):
         try:
@@ -85,18 +92,32 @@ class Client:
                                 print("[sistem] verific-o cu el pe alt canal")
                     if fut is not None and not fut.done():
                         fut.set_result(key)
-                elif kind == "MSG":
+                elif kind in ("MSG", "GROUP_MSG"):
                     task = asyncio.create_task(self.show_message(msg))
                     self.tasks.add(task)
                     task.add_done_callback(self.tasks.discard)
                 elif kind == "USERS":
                     print("[sistem] online:", ", ".join(msg.get("users", [])))
+                elif kind == "JOINED":
+                    self.room = msg.get("room")
+                    print(f"[sistem] ai intrat in {self.room}, membri:", ", ".join(msg.get("members", [])))
+                elif kind == "LEFT":
+                    if self.room == msg.get("room"):
+                        self.room = None
+                    print("[sistem] ai iesit din", msg.get("room"))
+                elif kind == "MEMBERS":
+                    waiter = self.members_waiter
+                    if waiter is not None and not waiter.done():
+                        waiter.set_result(msg.get("members", []))
                 elif kind == "ERROR":
                     reason = msg.get("reason", "")
                     if self.pending and reason == "utilizator necunoscut":
                         fut = next(iter(self.pending.values()))
                         if not fut.done():
                             fut.set_result(None)
+                    elif self.members_waiter is not None and reason == "nu esti in camera":
+                        if not self.members_waiter.done():
+                            self.members_waiter.set_result(None)
                     else:
                         print("[eroare]", reason)
         except (asyncio.IncompleteReadError, ConnectionError, ValueError):
@@ -110,6 +131,40 @@ class Client:
         ciphertext = encrypt(text, self.private, key)
         await self.send({"type": "MSG", "to": to, "ciphertext": ciphertext})
         print(f"[tu -> {to}] {text}")
+
+    async def get_members(self, room):
+        fut = asyncio.get_running_loop().create_future()
+        self.members_waiter = fut
+        await self.send({"type": "MEMBERS", "room": room})
+        try:
+            return await asyncio.wait_for(fut, 3)
+        except TimeoutError:
+            return None
+        finally:
+            self.members_waiter = None
+
+    async def send_group(self, text):
+        if self.room is None:
+            print("[sistem] nu esti intr-o camera, foloseste /join <camera>")
+            return
+        members = await self.get_members(self.room)
+        if members is None:
+            print("[sistem] nu pot obtine lista membrilor")
+            return
+        items = []
+        for member in members:
+            if member == self.name:
+                continue
+            key = await self.get_key(member)
+            if key is None:
+                print(f"[sistem] sar peste {member}: nu am o cheie de incredere")
+                continue
+            items.append({"to": member, "ciphertext": encrypt(text, self.private, key)})
+        if not items:
+            print("[sistem] nu e nimeni altcineva in camera")
+            return
+        await self.send({"type": "GROUP_MSG", "room": self.room, "messages": items})
+        print(f"[tu -> {self.room}] {text}")
 
     async def handle_line(self, line):
         """Intoarce False cand utilizatorul vrea sa iasa."""
@@ -138,6 +193,21 @@ class Client:
                 trust_key(self.name, peer, pub)
                 self.keys[peer] = pub_from_str(pub)
                 print(f"[sistem] cheie acceptata pentru {peer}, amprenta:", fingerprint(self.keys[peer]))
+        elif line.startswith("/join "):
+            await self.send({"type": "JOIN", "room": line.split(" ", 1)[1].strip()})
+        elif line == "/leave":
+            if self.room is None:
+                print("[sistem] nu esti intr-o camera")
+            else:
+                await self.send({"type": "LEAVE", "room": self.room})
+        elif line == "/members":
+            if self.room is None:
+                print("[sistem] nu esti intr-o camera")
+            else:
+                members = await self.get_members(self.room)
+                print("[sistem] membri:", ", ".join(members or []))
+        elif line.startswith("/group "):
+            await self.send_group(line.split(" ", 1)[1])
         elif line.startswith("/msg "):
             parts = line.split(" ", 2)
             if len(parts) < 3 or not parts[2].strip():
