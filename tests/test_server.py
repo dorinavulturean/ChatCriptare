@@ -213,3 +213,22 @@ def test_ciphertext_prea_lung():
     got = asyncio.run(with_server(scenario))
     assert got == {"type": "ERROR", "reason": "mesaj invalid sau prea lung"}
 
+def test_anunt_efemer_nu_se_pune_in_coada():
+    async def scenario(port):
+        rb, wb = await connect(port, "bogdan")
+        assert (await unpack(rb))["type"] == "OK"
+        wb.close()
+        await wait_offline("bogdan")
+
+        ra, wa = await connect(port, "ana")
+        assert (await unpack(ra))["type"] == "OK"
+        wa.write(pack({"type": "MSG", "to": "bogdan", "ciphertext": "eph1:abc"}))
+        await wa.drain()
+        got = await asyncio.wait_for(unpack(ra), 2)
+        wa.close()
+        return got, server_main.storage.pending("bogdan")
+
+    got, pending = asyncio.run(with_server(scenario))
+    assert got == {"type": "ERROR", "reason": "utilizator offline"}
+    assert pending == []
+

@@ -5,22 +5,22 @@ import threading
 from nacl.exceptions import CryptoError
 
 from client.keystore import check_known, load_or_create, trust_key
-from common.crypto import decrypt, encrypt, fingerprint, pub_from_str, pub_to_str
+from common.crypto import PeerSession, decrypt, encrypt, fingerprint, pub_from_str, pub_to_str
 from common.protocol import pack, unpack
 
 HOST = "localhost"
 PORT = 9000
-
 MAX_TEXT_BYTES = 4000
+
+HELP = (
+    "Comenzi: /list, /msg <nume> <text>, /join <camera>, /leave, /members, "
+    "/group <text>, /fingerprint [nume], /trust <nume>, "
+    "/rotate <nume>, /session <nume>, /quit"
+)
 
 
 def too_long(text):
     return len(text.encode("utf-8")) > MAX_TEXT_BYTES
-
-HELP = (
-    "Comenzi: /list, /msg <nume> <text>, /join <camera>, /leave, /members, "
-    "/group <text>, /fingerprint [nume], /trust <nume>, /quit"
-)
 
 
 class Client:
@@ -29,12 +29,14 @@ class Client:
         self.private = private
         self.reader = reader
         self.writer = writer
-        self.keys = {}  # nume -> cheie publica
+        self.keys = {}  # nume -> cheie publica de identitate
         self.pending = {}  # nume -> Future (cerere GET_KEY in curs)
         self.tasks = set()
         self.untrusted = {}  # nume -> cheie noua, in asteptare de acceptare
         self.room = None  # camera curenta
         self.members_waiter = None  # Future pentru raspunsul MEMBERS
+        self.sessions = {}  # nume -> PeerSession (chei efemere)
+        self.handshakes = {}  # nume -> Future (handshake in curs)
 
     async def send(self, msg):
         self.writer.write(pack(msg))
@@ -54,6 +56,50 @@ class Client:
         finally:
             self.pending.pop(name, None)
 
+    def session_for(self, peer, identity_pub):
+        session = self.sessions.get(peer)
+        if session is None:
+            session = PeerSession(self.private, identity_pub)
+            self.sessions[peer] = session
+        return session
+
+    async def handshake(self, peer, session):
+        """Schimb de chei efemere. Intoarce True daca celalalt a raspuns."""
+        fut = asyncio.get_running_loop().create_future()
+        self.handshakes[peer] = fut
+        announcement = "eph1:" + session.new_ephemeral()
+        await self.send({"type": "MSG", "to": peer, "ciphertext": announcement})
+        try:
+            return await asyncio.wait_for(fut, 3)
+        except TimeoutError:
+            return False
+        finally:
+            self.handshakes.pop(peer, None)
+
+    async def handle_handshake(self, sender, data, identity_pub):
+        session = self.session_for(sender, identity_pub)
+        kind, _, payload = data.partition(":")
+        try:
+            fresh = session.accept(payload)
+        except (CryptoError, ValueError):
+            print(f"[ATENTIE] anunt de cheie efemera invalid de la {sender}, ignorat")
+            return
+        if not fresh:
+            return
+        if kind == "eph1":
+            reply = "eph2:" + session.new_ephemeral()
+            await self.send({"type": "MSG", "to": sender, "ciphertext": reply})
+        else:
+            fut = self.handshakes.get(sender)
+            if fut is not None and not fut.done():
+                fut.set_result(True)
+
+    async def lost_session(self, sender, identity_pub):
+        print(f"[sistem] mesaj de la {sender} cu chei efemere necunoscute (sesiune pierduta)")
+        session = self.session_for(sender, identity_pub)
+        if await self.handshake(sender, session):
+            print(f"[sistem] sesiune noua cu {sender}, cere-i sa retrimita mesajul")
+
     async def show_message(self, msg):
         sender = msg.get("from", "?")
         room = msg.get("room")
@@ -64,8 +110,20 @@ class Client:
         if key is None:
             print(f"{tag}[{sender}] (nu am o cheie de incredere pentru expeditor)")
             return
+        data = msg.get("ciphertext", "")
+        if data.startswith(("eph1:", "eph2:")):
+            await self.handle_handshake(sender, data, key)
+            return
         try:
-            text = decrypt(msg.get("ciphertext", ""), self.private, key)
+            if data.startswith("fs1:"):
+                session = self.sessions.get(sender)
+                if session is None:
+                    await self.lost_session(sender, key)
+                    return
+                text = session.decrypt(data)
+                tag = "[fs]" + tag
+            else:
+                text = decrypt(data, self.private, key)
         except (CryptoError, ValueError):
             print(f"{tag}[{sender}] (mesaj invalid sau modificat, respins)")
             return
@@ -128,6 +186,10 @@ class Client:
                     elif self.members_waiter is not None and reason == "nu esti in camera":
                         if not self.members_waiter.done():
                             self.members_waiter.set_result(None)
+                    elif self.handshakes and reason == "utilizator offline":
+                        fut = next(iter(self.handshakes.values()))
+                        if not fut.done():
+                            fut.set_result(False)
                     else:
                         print("[eroare]", reason)
         except (asyncio.IncompleteReadError, ConnectionError, ValueError):
@@ -141,9 +203,19 @@ class Client:
         if key is None:
             print("[sistem] utilizator necunoscut")
             return
-        ciphertext = encrypt(text, self.private, key)
+        session = self.session_for(to, key)
+        ok = True
+        if not session.ready() or session.needs_rotation():
+            ok = await self.handshake(to, session)
+        if ok:
+            ciphertext = session.encrypt(text)
+            note = ""
+        else:
+            self.sessions.pop(to, None)
+            ciphertext = encrypt(text, self.private, key)
+            note = " (fara forward secrecy: destinatarul nu e disponibil)"
         await self.send({"type": "MSG", "to": to, "ciphertext": ciphertext})
-        print(f"[tu -> {to}] {text}")
+        print(f"[tu -> {to}] {text}{note}")
 
     async def get_members(self, room):
         fut = asyncio.get_running_loop().create_future()
@@ -208,7 +280,29 @@ class Client:
             else:
                 trust_key(self.name, peer, pub)
                 self.keys[peer] = pub_from_str(pub)
+                self.sessions.pop(peer, None)
                 print(f"[sistem] cheie acceptata pentru {peer}, amprenta:", fingerprint(self.keys[peer]))
+        elif line.startswith("/rotate "):
+            peer = line.split(" ", 1)[1].strip()
+            key = await self.get_key(peer)
+            if key is None:
+                print("[sistem] utilizator necunoscut")
+            elif await self.handshake(peer, self.session_for(peer, key)):
+                print(f"[sistem] chei efemere noi cu {peer}")
+            else:
+                self.sessions.pop(peer, None)
+                print(f"[sistem] {peer} nu raspunde, nu pot rota cheile")
+        elif line.startswith("/session "):
+            peer = line.split(" ", 1)[1].strip()
+            session = self.sessions.get(peer)
+            if session is None or not session.ready():
+                print(f"[sistem] nu exista sesiune efemera cu {peer}")
+            else:
+                print(
+                    f"[sistem] cheia mea efemera: {session.my_current}, "
+                    f"a lui {peer}: {session.their_current}, "
+                    f"mesaje trimise: {session.sent}"
+                )
         elif line.startswith("/join "):
             await self.send({"type": "JOIN", "room": line.split(" ", 1)[1].strip()})
         elif line == "/leave":
