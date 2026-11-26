@@ -52,6 +52,8 @@ class Client:
         sender = msg.get("from", "?")
         room = msg.get("room")
         tag = f"[{room}]" if room else ""
+        if msg.get("offline"):
+            tag = "[offline]" + tag
         key = await self.get_key(sender)
         if key is None:
             print(f"{tag}[{sender}] (nu am o cheie de incredere pentru expeditor)")
@@ -109,6 +111,8 @@ class Client:
                     waiter = self.members_waiter
                     if waiter is not None and not waiter.done():
                         waiter.set_result(msg.get("members", []))
+                elif kind == "QUEUED":
+                    print(f"[sistem] {msg.get('to')} e offline, mesajul ajunge cand se conecteaza")
                 elif kind == "ERROR":
                     reason = msg.get("reason", "")
                     if self.pending and reason == "utilizator necunoscut":
@@ -126,7 +130,7 @@ class Client:
     async def send_private(self, to, text):
         key = await self.get_key(to)
         if key is None:
-            print("[sistem] utilizator necunoscut sau offline")
+            print("[sistem] utilizator necunoscut")
             return
         ciphertext = encrypt(text, self.private, key)
         await self.send({"type": "MSG", "to": to, "ciphertext": ciphertext})

@@ -1,7 +1,9 @@
 import asyncio
 
 from common.protocol import pack, unpack
+from server import main as server_main
 from server.main import clients, handle_client
+from server.storage import Storage
 
 
 async def connect(port, name):
@@ -13,6 +15,7 @@ async def connect(port, name):
 
 async def with_server(scenario):
     clients.clear()
+    server_main.storage = Storage()
     server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     async with server:
@@ -111,6 +114,51 @@ def test_grup_nemembru_este_respins():
         got = await asyncio.wait_for(unpack(ra), 2)
         wa.close()
         wb.close()
+        return got
+
+    got = asyncio.run(with_server(scenario))
+    assert got["type"] == "ERROR"
+
+async def wait_offline(name):
+    for _ in range(100):
+        if name not in clients:
+            return
+        await asyncio.sleep(0.05)
+
+
+def test_mesaj_offline_livrat_la_conectare():
+    async def scenario(port):
+        rb, wb = await connect(port, "bogdan")
+        assert (await unpack(rb))["type"] == "OK"
+        wb.close()
+        await wait_offline("bogdan")
+
+        ra, wa = await connect(port, "ana")
+        assert (await unpack(ra))["type"] == "OK"
+        wa.write(pack({"type": "MSG", "to": "bogdan", "ciphertext": "xyz"}))
+        await wa.drain()
+        queued = await asyncio.wait_for(unpack(ra), 2)
+
+        rb2, wb2 = await connect(port, "bogdan")
+        assert (await unpack(rb2))["type"] == "OK"
+        got = await asyncio.wait_for(unpack(rb2), 2)
+        wa.close()
+        wb2.close()
+        return queued, got
+
+    queued, got = asyncio.run(with_server(scenario))
+    assert queued == {"type": "QUEUED", "to": "bogdan"}
+    assert got == {"type": "MSG", "from": "ana", "ciphertext": "xyz", "offline": True}
+
+
+def test_offline_destinatar_necunoscut():
+    async def scenario(port):
+        ra, wa = await connect(port, "ana")
+        assert (await unpack(ra))["type"] == "OK"
+        wa.write(pack({"type": "MSG", "to": "nimeni", "ciphertext": "x"}))
+        await wa.drain()
+        got = await asyncio.wait_for(unpack(ra), 2)
+        wa.close()
         return got
 
     got = asyncio.run(with_server(scenario))
