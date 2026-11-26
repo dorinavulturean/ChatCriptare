@@ -37,7 +37,7 @@ class Client:
         await self.send({"type": "GET_KEY", "name": name})
         try:
             return await asyncio.wait_for(fut, 3)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         finally:
             self.pending.pop(name, None)
