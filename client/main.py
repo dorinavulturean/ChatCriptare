@@ -4,14 +4,14 @@ import threading
 
 from nacl.exceptions import CryptoError
 
-from client.keystore import load_or_create
+from client.keystore import check_known, load_or_create, trust_key
 from common.crypto import decrypt, encrypt, fingerprint, pub_from_str, pub_to_str
 from common.protocol import pack, unpack
 
 HOST = "localhost"
 PORT = 9000
 
-HELP = "Comenzi: /list, /msg <nume> <text>, /fingerprint, /quit"
+HELP = "Comenzi: /list, /msg <nume> <text>, /fingerprint [nume], /trust <nume>, /quit"
 
 
 class Client:
@@ -23,6 +23,7 @@ class Client:
         self.keys = {}  # nume -> cheie publica
         self.pending = {}  # nume -> Future (cerere GET_KEY in curs)
         self.tasks = set()
+        self.untrusted = {}  # nume -> cheie noua, in asteptare de acceptare
 
     async def send(self, msg):
         self.writer.write(pack(msg))
@@ -46,7 +47,7 @@ class Client:
         sender = msg.get("from", "?")
         key = await self.get_key(sender)
         if key is None:
-            print(f"[{sender}] (nu am cheia expeditorului)")
+            print(f"[{sender}] (nu am o cheie de incredere pentru expeditor)")
             return
         try:
             text = decrypt(msg.get("ciphertext", ""), self.private, key)
@@ -61,13 +62,27 @@ class Client:
                 msg = await unpack(self.reader)
                 kind = msg.get("type")
                 if kind == "KEY":
-                    fut = self.pending.get(msg.get("name"))
+                    peer = msg.get("name")
+                    if not peer:
+                        continue
+                    fut = self.pending.get(peer)
                     try:
                         key = pub_from_str(msg.get("pubkey", ""))
                     except ValueError:
                         key = None
                     if key is not None:
-                        self.keys[msg["name"]] = key
+                        status = check_known(self.name, peer, msg["pubkey"])
+                        if status == "changed":
+                            self.untrusted[peer] = msg["pubkey"]
+                            print(f"[ATENTIE] Cheia lui {peer} S-A SCHIMBAT!")
+                            print("[ATENTIE] Poate fi un atacator. Amprenta noua:", fingerprint(key))
+                            print(f"[ATENTIE] Verific-o cu {peer}. Daca e corecta: /trust {peer}")
+                            key = None
+                        else:
+                            self.keys[peer] = key
+                            if status == "new":
+                                print(f"[sistem] cheie noua pentru {peer}, amprenta:", fingerprint(key))
+                                print("[sistem] verific-o cu el pe alt canal")
                     if fut is not None and not fut.done():
                         fut.set_result(key)
                 elif kind == "MSG":
@@ -106,6 +121,23 @@ class Client:
             await self.send({"type": "LIST"})
         elif line == "/fingerprint":
             print("[sistem] amprenta ta:", fingerprint(self.private.public_key))
+        elif line.startswith("/fingerprint "):
+            peer = line.split(" ", 1)[1].strip()
+            key = await self.get_key(peer)
+            if key is None:
+                print("[sistem] nu pot obtine o cheie de incredere pentru", peer)
+            else:
+                print(f"[sistem] amprenta lui {peer}:", fingerprint(key))
+                print("[sistem] compar-o cu el pe alt canal (telefon, in persoana)")
+        elif line.startswith("/trust "):
+            peer = line.split(" ", 1)[1].strip()
+            pub = self.untrusted.pop(peer, None)
+            if pub is None:
+                print("[sistem] nu am nicio cheie noua de acceptat pentru", peer)
+            else:
+                trust_key(self.name, peer, pub)
+                self.keys[peer] = pub_from_str(pub)
+                print(f"[sistem] cheie acceptata pentru {peer}, amprenta:", fingerprint(self.keys[peer]))
         elif line.startswith("/msg "):
             parts = line.split(" ", 2)
             if len(parts) < 3 or not parts[2].strip():
