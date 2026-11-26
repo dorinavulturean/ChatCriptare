@@ -1,0 +1,4 @@
+﻿server-1  | 2026-11-26 07:22:24,868 server pornit pe 0.0.0.0:9000
+server-1  | 2026-11-26 07:22:51,111 REGISTER ana
+server-1  | 2026-11-26 07:23:17,726 REGISTER bogdan
+server-1  | 2026-11-26 08:00:30,300 MSG ana -> bogdan len=92
